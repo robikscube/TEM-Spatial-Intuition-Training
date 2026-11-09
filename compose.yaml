@@ -1,0 +1,63 @@
+x-tem: &tem
+  read_only: true
+  network_mode: none
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp
+  environment:
+    TEM_UPSTREAM: /upstream
+    TEM_RUNS: /runs
+  volumes:
+    - type: bind
+      source: ${TEM_UPSTREAM_DIR:-./research/reference/torch_tem}
+      target: /upstream
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TEM_RUNS_DIR:-./container-runs}
+      target: /runs
+      read_only: false
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TEM_EXPERIMENTS_DIR:-./experiments}
+      target: /app/experiments
+      read_only: true
+      bind:
+        create_host_path: false
+
+services:
+  cpu:
+    <<: *tem
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TEM_ACCELERATOR: cpu
+    image: tem-spatial-intuition-training:cpu
+    platform: linux/amd64
+
+  cuda:
+    <<: *tem
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TEM_ACCELERATOR: cuda
+    image: tem-spatial-intuition-training:cuda
+    platform: linux/amd64
+    profiles:
+      - gpu
+    command:
+      - --device
+      - cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu

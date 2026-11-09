@@ -1,0 +1,12 @@
+# Only the runtime source and dependency pins enter the build context.
+**
+!Dockerfile
+!scripts/
+!scripts/train_tem.py
+!scripts/tem_trained_adapter.py
+!scripts/score_tem_returns.py
+!docker/
+!docker/pyproject.toml
+!docker/uv.lock
+!docker/check_runtime.py
+!docker/upstream.lock.json
