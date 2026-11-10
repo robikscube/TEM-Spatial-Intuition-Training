@@ -8,6 +8,7 @@ x-tem: &tem
   environment:
     TEM_UPSTREAM: /upstream
     TEM_RUNS: /runs
+    PYTHONPATH: /app/local-layouts
   volumes:
     - type: bind
       source: ${TEM_UPSTREAM_DIR:-./research/reference/torch_tem}

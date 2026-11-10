@@ -853,16 +853,18 @@ class TrainingSession:
         return chunk, events
 
 
-def compute_loss(forward: list, visited: list[list[bool]], loss_weights) -> dict:
+def compute_loss(
+    forward: list, visited: list[list[bool]], loss_weights, *, node_ids=None
+) -> dict:
     """Upstream run.py's visited-location loss mask, returned as plain data."""
     torch = require_torch()
     total = loss_weights.new_zeros(())
     component_rows = []
     scored = 0
-    for step in forward:
+    for index, step in enumerate(forward):
         step_losses = []
         for env_index, env_visited in enumerate(visited):
-            node_id = step.g[env_index]["id"]
+            node_id = step.g[env_index]["id"] if node_ids is None else node_ids[index][env_index]
             if env_visited[node_id]:
                 step_losses.append(
                     loss_weights * torch.stack([loss[env_index] for loss in step.L])

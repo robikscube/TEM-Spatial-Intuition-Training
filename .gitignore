@@ -20,6 +20,7 @@
 !/docs/DOCKER.md
 !/docs/GIT.md
 /scripts/architectural_grid.py
+/scripts/compare_house3_representations.py
 /scripts/evaluate_access_transfer.py
 /scripts/evaluate_fourth_column.py
 /scripts/run_access_scale_pair.ps1

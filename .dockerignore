@@ -5,6 +5,8 @@
 !scripts/train_tem.py
 !scripts/tem_trained_adapter.py
 !scripts/score_tem_returns.py
+!scripts/access_graph_tem.py
+!scripts/access_graph_worlds.py
 !docker/
 !docker/pyproject.toml
 !docker/uv.lock

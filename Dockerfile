@@ -18,10 +18,11 @@ COPY docker/pyproject.toml docker/uv.lock /app/docker/
 
 RUN uv sync --project /app/docker --locked --no-dev --no-install-project --extra "$TEM_ACCELERATOR"
 
-COPY scripts/*.py /app/scripts/
+COPY scripts/train_tem.py scripts/tem_trained_adapter.py scripts/score_tem_returns.py \
+     scripts/access_graph_tem.py scripts/access_graph_worlds.py /app/scripts/
 COPY docker/check_runtime.py docker/upstream.lock.json /app/docker/
 
-RUN mkdir -p /runs /upstream /app/experiments && chown -R 10001:10001 /runs
+RUN mkdir -p /runs /upstream /app/experiments /app/local-layouts && chown -R 10001:10001 /runs
 
 USER 10001:10001
 
