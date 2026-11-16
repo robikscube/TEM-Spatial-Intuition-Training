@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.13.15
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Resolve upstream torch_tem commit
+        id: upstream
+        run: echo "commit=$(jq -r '.commit' docker/upstream.lock.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Clone torch_tem reference
+        run: |
+          git clone https://github.com/jbakermans/torch_tem.git research/reference/torch_tem
+          git -C research/reference/torch_tem checkout "${{ steps.upstream.outputs.commit }}"
+
+      - name: Sync dependencies
+        run: uv sync --project docker --locked --extra cpu
+
+      - name: Run unit tests
+        run: |
+          uv run --project docker --extra cpu python -m unittest discover -s tests/training -p 'test_*.py' -v
+          uv run --project docker --extra cpu python -m unittest discover -s tests/training_qa -p 'test_*.py' -v
+          uv run --project docker --extra cpu python -m unittest discover -s tests/packaging -p 'test_*.py' -v
+
+      - name: Build Docker image
+        run: docker build --build-arg TEM_ACCELERATOR=cpu --tag tem-spatial-intuition-training:ci .

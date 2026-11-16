@@ -19,7 +19,9 @@ COPY docker/pyproject.toml docker/uv.lock /app/docker/
 RUN uv sync --project /app/docker --locked --no-dev --no-install-project --extra "$TEM_ACCELERATOR"
 
 COPY scripts/train_tem.py scripts/tem_trained_adapter.py scripts/score_tem_returns.py \
-     scripts/access_graph_tem.py scripts/access_graph_worlds.py /app/scripts/
+     scripts/access_graph_tem.py scripts/access_graph_worlds.py \
+     scripts/multitopology_graphs.py scripts/multitopology_retrain_graphs.py \
+     scripts/train_multitopology_retrain.py /app/scripts/
 COPY docker/check_runtime.py docker/upstream.lock.json /app/docker/
 
 RUN mkdir -p /runs /upstream /app/experiments /app/local-layouts && chown -R 10001:10001 /runs

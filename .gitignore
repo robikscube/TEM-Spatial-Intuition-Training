@@ -14,6 +14,7 @@
 /checkpoints/
 /artifacts/
 /container-runs/
+/cohort-runs/
 /replays/
 /public/
 /docs/*
