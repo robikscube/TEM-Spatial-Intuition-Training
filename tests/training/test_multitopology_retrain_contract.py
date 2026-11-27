@@ -863,5 +863,112 @@ class CheckpointCommitTransactionTest(unittest.TestCase):
         self.assertEqual(alias["update"], 1, "resume must rewind the alias to the committed ledger entry")
 
 
+class GradClipAndNumericalDiagnosticsTest(unittest.TestCase):
+    """Contract tests for tri-state numerical diagnostics and optional grad_clip_norm."""
+
+    def test_grad_clip_config_validation_matrix(self):
+        # Absent = disabled (valid)
+        tem.validate_config(config_dict(training_settings()))
+        # Positive finite int/float = valid
+        for good in (1, 0.5, 500.0):
+            with self.subTest(good=good):
+                tem.validate_config(config_dict(training_settings(grad_clip_norm=good)))
+        # Invalid values rejected
+        for bad in (0, -1.0, True, False, None, float("nan"), float("inf"), float("-inf"), "500", [1.0], {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    tem.validate_config(config_dict(training_settings(grad_clip_norm=bad)))
+
+    def test_update_ledger_distinguishes_absent_and_nonfinite_gradients(self):
+        ledger = tem.UpdateLedger(requested=2)
+        with self.assertRaisesRegex(ValueError, "no gradients"):
+            ledger.validate(loss_value=1.0, scored=1, requires_grad=True, gradient_state="absent")
+        with self.assertRaisesRegex(ValueError, "nonfinite gradient"):
+            ledger.validate(loss_value=1.0, scored=1, requires_grad=True, gradient_state="nonfinite")
+        with self.assertRaisesRegex(ValueError, "invalid gradient_state"):
+            ledger.validate(loss_value=1.0, scored=1, requires_grad=True, gradient_state="bogus")
+        ledger.record(loss_value=1.0, scored=1, requires_grad=True, gradient_state="finite")
+        self.assertEqual(ledger.updates, 1)
+
+    def test_pairing_and_continuation_enforce_grad_clip_symmetry(self):
+        single = {**config_dict(training_settings()), "arm": "single", "training_graph_ids": ["g0"]}
+        diverse_same = {**config_dict(training_settings()), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        diverse_diff = {**config_dict(training_settings(grad_clip_norm=50.0)), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        rec = {"manifest_sha256": "a" * 64}
+        self.assertTrue(tem.pairing_checks(single, diverse_same, rec, rec)["checks"]["grad_clip_norm"])
+        self.assertFalse(tem.pairing_checks(single, diverse_diff, rec, rec)["checks"]["grad_clip_norm"])
+
+        # Enabling grad_clip_norm across a continuation must fail closed.
+        prior_cfg = {**config_dict(interim_settings()), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        next_cfg = {**config_dict(standard_settings(grad_clip_norm=50.0)), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        prior_rec = {"config_sha256": "1" * 64, "manifest_sha256": "a" * 64, "code_sha256": {"k": "v"}, "arm": "diverse", "training_seed": 3}
+        next_rec = {"config_sha256": "2" * 64, "manifest_sha256": "a" * 64, "code_sha256": {"k": "v"}, "arm": "diverse", "training_seed": 3}
+        with self.assertRaisesRegex(ValueError, "grad_clip_norm"):
+            tem.continuation_checks(prior_cfg, prior_rec, tem.INTERIM_UPDATES, next_cfg, next_rec)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for tensor grad-clip tests")
+    def test_apply_grad_clip_and_finiteness_diagnostics(self):
+        torch = adapter.require_torch()
+        model = torch.nn.Linear(2, 1, bias=False)
+        self.assertEqual(tem._gradient_state(torch, model), "absent")
+
+        model.weight.grad = torch.tensor([[3.0, 4.0]])
+        self.assertEqual(tem._gradient_state(torch, model), "finite")
+        # Disabled path leaves gradients untouched
+        self.assertIsNone(tem._apply_grad_clip(torch, model, max_norm=None))
+        self.assertAlmostEqual(float(model.weight.grad.norm()), 5.0, places=5)
+
+        # Enabled path clips oversized finite gradient to threshold
+        meta = tem._apply_grad_clip(torch, model, max_norm=2.5)
+        self.assertTrue(meta["applied"])
+        self.assertAlmostEqual(meta["raw_global_norm"], 5.0, places=5)
+        self.assertLessEqual(meta["post_global_norm"], 2.5001)
+        json.dumps(meta, allow_nan=False)
+
+        # Nonfinite gradient classified cleanly and produces strict-JSON report
+        model.weight.grad = torch.tensor([[float("inf"), 1.0]])
+        self.assertEqual(tem._gradient_state(torch, model), "nonfinite")
+        report = tem._finiteness_report(torch, model)
+        self.assertFalse(report["all_grads_finite"])
+        self.assertEqual(report["parameters"][0]["first_nonfinite_flat_index"], 0)
+        json.dumps(report, allow_nan=False)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for step preparation tests")
+    def test_prepare_step_gradients_preserves_legacy_preclip_and_fails_closed(self):
+        torch = adapter.require_torch()
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.weight.grad = torch.tensor([[10.0]])
+        # Disabled path must never call clip_grad_norm_
+        with mock.patch.object(torch.nn.utils, "clip_grad_norm_", side_effect=AssertionError("must not clip")):
+            norm, max_abs, clip = tem._prepare_step_gradients(
+                torch, model, grad_clip_norm=None, gradient_state="finite",
+                loss=1.0, loss_components=None, attempted_update=1,
+            )
+        self.assertIsNone(clip)
+        self.assertAlmostEqual(norm, 10.0, places=5)
+        self.assertAlmostEqual(max_abs, 10.0, places=5)
+
+        # Enabled path preserves pre-clip legacy norm/max_abs while clipping gradient
+        norm, max_abs, clip = tem._prepare_step_gradients(
+            torch, model, grad_clip_norm=4.0, gradient_state="finite",
+            loss=1.0, loss_components=None, attempted_update=1,
+        )
+        self.assertAlmostEqual(norm, 10.0, places=5)
+        self.assertAlmostEqual(max_abs, 10.0, places=5)
+        self.assertTrue(clip["applied"])
+        self.assertAlmostEqual(float(model.weight.grad.abs().max()), 4.0, places=5)
+
+        # Clip helper error wraps as NumericalTrainingError(phase="post_clip")
+        model.weight.grad = torch.tensor([[10.0]])
+        with mock.patch.object(tem, "_apply_grad_clip", side_effect=RuntimeError("reduction overflow")):
+            with self.assertRaises(tem.NumericalTrainingError) as ctx:
+                tem._prepare_step_gradients(
+                    torch, model, grad_clip_norm=4.0, gradient_state="finite",
+                    loss=1.0, loss_components=None, attempted_update=1,
+                )
+        self.assertEqual(ctx.exception.phase, "post_clip")
+        json.dumps(ctx.exception.diagnostic, allow_nan=False)
+
+
 if __name__ == "__main__":
     unittest.main()
