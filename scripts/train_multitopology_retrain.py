@@ -152,8 +152,16 @@ TRAINING_KEYS = {
     # Optional and defaulted to "legal_walk", i.e. the historical uniform
     # legal-transition route, so frozen configs keep their exact data stream.
     "route_policy",
+    # Optional global-L2 gradient clipping threshold. DISABLED means the key is
+    # absent (the exact historical numerical path). A finite positive int/float
+    # enables the prospective bound; there is no silent default threshold.
+    "grad_clip_norm",
 }
-REQUIRED_TRAINING_KEYS = TRAINING_KEYS - {"scientific_stage", "route_policy"}
+REQUIRED_TRAINING_KEYS = TRAINING_KEYS - {"scientific_stage", "route_policy", "grad_clip_norm"}
+GRAD_CLIP_METRIC_FIELDS = (
+    "grad_clip_enabled", "grad_clip_threshold",
+    "grad_clip_raw_global_norm", "grad_clip_post_global_norm", "grad_clip_applied",
+)
 
 
 class RefusalError(RuntimeError):
@@ -162,6 +170,15 @@ class RefusalError(RuntimeError):
 
 class ZeroScoredUpdate(RuntimeError):
     """The update had no eligible visited-location prediction and must not count."""
+
+
+class NumericalTrainingError(RuntimeError):
+    """Fail-closed numerical abort carrying bounded diagnostic metadata."""
+
+    def __init__(self, message: str, *, phase: str, diagnostic: dict):
+        super().__init__(message)
+        self.phase = phase
+        self.diagnostic = diagnostic
 
 
 # --------------------------------------------------------------------- helpers
@@ -486,6 +503,13 @@ def validate_config(config: dict, *, resolved: bool = False) -> None:
         raise ValueError("training.device must be explicit 'cpu' or 'cuda'")
     if settings.get("route_policy", DEFAULT_ROUTE_POLICY) not in ROUTE_POLICIES:
         raise ValueError(f"training.route_policy must be one of {list(ROUTE_POLICIES)}")
+    if "grad_clip_norm" in settings:
+        clip = settings["grad_clip_norm"]
+        if type(clip) not in (int, float) or not math.isfinite(clip) or clip <= 0:
+            raise ValueError(
+                "training.grad_clip_norm must be a finite positive number; "
+                "omit the key to disable gradient clipping"
+            )
     if type(settings["scientific_mode"]) is not bool:
         raise ValueError("training.scientific_mode must be a boolean")
     _require_float(settings, "max_seconds")
@@ -670,24 +694,38 @@ class UpdateLedger:
     skipped: int = 0
 
     def validate(self, *, loss_value: float, scored: int, requires_grad: bool,
-                 gradients_finite: bool) -> None:
+                 gradients_finite: bool | None = None,
+                 gradient_state: str | None = None) -> None:
         if not math.isfinite(float(loss_value)):
             raise ValueError("nonfinite training loss")
         if scored <= 0:
             raise ZeroScoredUpdate("update has no scored visited-location prediction")
         if not requires_grad:
             raise ValueError("training loss does not require grad")
-        if not gradients_finite:
-            raise ValueError("training produced no gradients or nonfinite gradients")
+        if gradient_state is not None:
+            if gradient_state == "absent":
+                raise ValueError("training produced no gradients")
+            if gradient_state == "nonfinite":
+                raise ValueError("training produced a nonfinite gradient")
+            if gradient_state != "finite":
+                raise ValueError(f"invalid gradient_state: {gradient_state!r}")
+        elif gradients_finite is not None:
+            if not gradients_finite:
+                raise ValueError("training produced no gradients or nonfinite gradients")
+        else:
+            raise ValueError("gradient_state or gradients_finite is required")
 
     def commit(self) -> None:
         """Increment only after ``optimizer.step`` returned successfully."""
         self.updates += 1
 
     def record(self, *, loss_value: float, scored: int, requires_grad: bool,
-               gradients_finite: bool) -> None:
+               gradients_finite: bool | None = None,
+               gradient_state: str | None = None) -> None:
         self.validate(loss_value=loss_value, scored=scored,
-                      requires_grad=requires_grad, gradients_finite=gradients_finite)
+                      requires_grad=requires_grad,
+                      gradients_finite=gradients_finite,
+                      gradient_state=gradient_state)
         self.commit()
 
     def mark_skipped(self) -> None:
@@ -1459,7 +1497,7 @@ def archive_and_trim_metrics(out: Path, committed_update: int) -> dict | None:
 
 
 def save_failure_snapshot(model, optimizer, out: Path, update: int, *, record: dict,
-                          state: dict) -> dict:
+                          state: dict, diagnostic: dict | None = None) -> dict:
     """Persist a failure diagnostic that can never be mistaken for a checkpoint.
 
     A raised ``optimizer.step`` may have partially mutated weights. This file is
@@ -1496,6 +1534,9 @@ def save_failure_snapshot(model, optimizer, out: Path, update: int, *, record: d
             "snapshot has no authority"
         ),
     }
+    if diagnostic is not None:
+        document["diagnostic"] = diagnostic
+    json.dumps(document, allow_nan=False)
     write_json(out / "failed-snapshot.json", document)
     return document
 
@@ -1503,11 +1544,221 @@ def save_failure_snapshot(model, optimizer, out: Path, update: int, *, record: d
 # --------------------------------------------------------------- fit mechanics
 
 
-def _gradients_finite(torch, model) -> bool:
-    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+def _gradient_state(torch, model) -> str:
+    """Classify post-backward gradient state: 'absent', 'nonfinite', or 'finite'."""
+    gradients = [parameter.grad for parameter in model.parameters()
+                 if parameter.grad is not None]
     if not gradients:
-        return False
-    return all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+        return "absent"
+    if not all(bool(torch.isfinite(gradient).all()) for gradient in gradients):
+        return "nonfinite"
+    return "finite"
+
+
+def _gradients_finite(torch, model) -> bool:
+    return _gradient_state(torch, model) == "finite"
+
+
+def _json_safe_scalar(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _json_safe_components(components) -> list | None:
+    if components is None:
+        return None
+    return [_json_safe_scalar(value) for value in components]
+
+
+def _finiteness_report(torch, model) -> dict:
+    """Bounded per-parameter finiteness metadata (never raw tensor values)."""
+    rows = []
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        grad_ok = None if grad is None else bool(torch.isfinite(grad).all())
+        first = None
+        grad_norm = None
+        if grad is not None:
+            value = float(grad.norm())
+            grad_norm = value if math.isfinite(value) else None
+            if not grad_ok:
+                bad = (~torch.isfinite(grad)).flatten().nonzero()
+                first = int(bad[0, 0].item()) if bad.numel() else None
+        rows.append({
+            "name": name,
+            "shape": list(parameter.shape),
+            "dtype": str(parameter.dtype),
+            "requires_grad": bool(parameter.requires_grad),
+            "grad_is_none": grad is None,
+            "grad_finite": grad_ok,
+            "grad_nonfinite_count": (
+                0 if grad is None or grad_ok
+                else int((~torch.isfinite(grad)).sum().item())
+            ),
+            "first_nonfinite_flat_index": first,
+            "grad_norm": grad_norm,
+            "weight_finite": bool(torch.isfinite(parameter.data).all()),
+            "weight_nonfinite_count": int(
+                (~torch.isfinite(parameter.data)).sum().item()
+            ),
+        })
+    return {
+        "parameter_count": len(rows),
+        "all_weights_finite": all(row["weight_finite"] for row in rows),
+        "all_grads_finite": all(row["grad_finite"] is not False for row in rows),
+        "parameters": rows,
+    }
+
+
+def _parameter_finiteness(torch, model) -> tuple[bool, int]:
+    finite = True
+    count = 0
+    for parameter in model.parameters():
+        bad = int((~torch.isfinite(parameter.data)).sum().item())
+        if bad:
+            finite = False
+            count += bad
+    return finite, count
+
+
+def _numerical_diagnostic(*, phase: str, gradient_state: str, finiteness: dict,
+                          loss, loss_components, attempted_update: int,
+                          error: dict) -> dict:
+    return {
+        "phase": phase,
+        "gradient_state": gradient_state,
+        "finiteness": finiteness,
+        "loss": _json_safe_scalar(loss),
+        "loss_components": _json_safe_components(loss_components),
+        "attempted_update": attempted_update,
+        "error": error,
+    }
+
+
+def _numerical_error(*, phase: str, gradient_state: str, finiteness: dict,
+                     loss, loss_components, attempted_update: int,
+                     message: str, exc: BaseException | None = None) -> NumericalTrainingError:
+    return NumericalTrainingError(
+        message, phase=phase,
+        diagnostic=_numerical_diagnostic(
+            phase=phase, gradient_state=gradient_state, finiteness=finiteness,
+            loss=loss, loss_components=loss_components,
+            attempted_update=attempted_update,
+            error=({"type": type(exc).__name__, "message": str(exc)} if exc is not None
+                   else {"type": "NumericalTrainingError", "message": message}),
+        ),
+    )
+
+
+def _assert_pre_step_finite(torch, model, *, gradient_state: str, loss,
+                            loss_components, attempted_update: int) -> None:
+    finite, _count = _parameter_finiteness(torch, model)
+    if not finite:
+        raise _numerical_error(
+            phase="pre_step", gradient_state=gradient_state,
+            finiteness=_finiteness_report(torch, model),
+            loss=loss, loss_components=loss_components, attempted_update=attempted_update,
+            message="a model parameter was nonfinite before optimizer.step",
+        )
+
+
+def _max_abs_grad(model) -> float | None:
+    value = None
+    for parameter in model.parameters():
+        if parameter.grad is not None:
+            current = float(parameter.grad.abs().max())
+            value = current if value is None else max(value, current)
+    return value
+
+
+def _global_grad_norm(model) -> float | None:
+    total = 0.0
+    present = False
+    for parameter in model.parameters():
+        if parameter.grad is not None:
+            present = True
+            total += float((parameter.grad ** 2).sum())
+    return math.sqrt(total) if present else None
+
+
+def _apply_grad_clip(torch, model, *, max_norm):
+    """Apply prospective global L2 gradient clipping; no-op when disabled."""
+    if max_norm is None:
+        return None
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), float(max_norm), norm_type=2.0, error_if_nonfinite=True,
+    )
+    raw_global_norm = _json_safe_scalar(total_norm)
+    post_global_norm = _json_safe_scalar(_global_grad_norm(model))
+    applied = bool(
+        raw_global_norm is not None and float(max_norm) < raw_global_norm
+    )
+    return {
+        "raw_global_norm": raw_global_norm,
+        "post_global_norm": post_global_norm,
+        "threshold": _json_safe_scalar(max_norm),
+        "applied": applied,
+    }
+
+
+def _prepare_step_gradients(torch, model, *, grad_clip_norm, gradient_state,
+                            loss, loss_components, attempted_update):
+    """Compute legacy pre-clip metrics, optionally clip, and re-verify finiteness."""
+    norm = _gradient_norm(model)
+    max_abs = _max_abs_grad(model)
+    if grad_clip_norm is None:
+        return norm, max_abs, None
+    try:
+        clip = _apply_grad_clip(torch, model, max_norm=grad_clip_norm)
+    except Exception as exc:  # noqa: BLE001 - re-raised with diagnostics
+        raise _numerical_error(
+            phase="post_clip", gradient_state=gradient_state,
+            finiteness=_finiteness_report(torch, model),
+            loss=loss, loss_components=loss_components,
+            attempted_update=attempted_update,
+            message="gradient clipping failed", exc=exc,
+        ) from exc
+    post_clip_state = _gradient_state(torch, model)
+    if post_clip_state != "finite":
+        raise _numerical_error(
+            phase="post_clip", gradient_state=gradient_state,
+            finiteness=_finiteness_report(torch, model),
+            loss=loss, loss_components=loss_components,
+            attempted_update=attempted_update,
+            message="gradient clipping produced a nonfinite gradient",
+        )
+    return norm, max_abs, clip
+
+
+def _grad_clip_metric(enabled: bool, threshold, clip: dict | None) -> dict:
+    if not enabled:
+        return {
+            "grad_clip_enabled": False,
+            "grad_clip_threshold": None,
+            "grad_clip_raw_global_norm": None,
+            "grad_clip_post_global_norm": None,
+            "grad_clip_applied": None,
+        }
+    if clip is None:
+        return {
+            "grad_clip_enabled": True,
+            "grad_clip_threshold": _json_safe_scalar(threshold),
+            "grad_clip_raw_global_norm": None,
+            "grad_clip_post_global_norm": None,
+            "grad_clip_applied": None,
+        }
+    return {
+        "grad_clip_enabled": True,
+        "grad_clip_threshold": _json_safe_scalar(clip.get("threshold", threshold)),
+        "grad_clip_raw_global_norm": _json_safe_scalar(clip["raw_global_norm"]),
+        "grad_clip_post_global_norm": _json_safe_scalar(clip["post_global_norm"]),
+        "grad_clip_applied": bool(clip["applied"]),
+    }
 
 
 def _state_stream_delta(left_steps, right_steps, name: str) -> float:
@@ -1550,7 +1801,7 @@ def _vram_guard(torch, settings: dict) -> None:
 
 def _episode_update(torch, model, optimizer, plan, *, batch_size: int,
                     rollout: int, weights, device: str, ledger: UpdateLedger,
-                    step_grad_norm: bool = True) -> dict:
+                    step_grad_norm: bool = True, grad_clip_norm=None) -> dict:
     """One optimizer update over ``batch_size`` independent episodes.
 
     Each lane has its own graph, route and cue map (``BatchEpisodePlan``). The
@@ -1562,6 +1813,7 @@ def _episode_update(torch, model, optimizer, plan, *, batch_size: int,
     batch = _as_batch(plan, batch_size)
     visited = [[False] * batch.n_nodes for _ in range(batch.batch_size)]
     total = None
+    components = None
     scored = 0
     previous = None
     weights = weights.to(device)
@@ -1576,6 +1828,12 @@ def _episode_update(torch, model, optimizer, plan, *, batch_size: int,
         previous = [forward[-1]]
         total = loss["loss"] if total is None else total + loss["loss"]
         scored += loss["scored_predictions"]
+        chunk_components = loss.get("components")
+        if chunk_components:
+            components = (
+                list(chunk_components) if components is None
+                else [left + right for left, right in zip(components, chunk_components)]
+            )
     if scored <= 0:
         raise ZeroScoredUpdate("full episode batch produced no scored visited-location prediction")
     if not bool(torch.isfinite(total)):
@@ -1584,21 +1842,50 @@ def _episode_update(torch, model, optimizer, plan, *, batch_size: int,
         raise ValueError("full-episode loss does not require grad")
     optimizer.zero_grad(set_to_none=True)
     total.backward()
-    finite = _gradients_finite(torch, model)
-    # All pre-step validations happen here. Nothing is counted until the
-    # optimizer step below actually returns.
-    ledger.validate(loss_value=float(total.detach()), scored=scored,
-                    requires_grad=True, gradients_finite=finite)
-    norm = _gradient_norm(model) if step_grad_norm else None
+    gradient_state = _gradient_state(torch, model)
+    loss_value = float(total.detach())
+    attempted_update = ledger.updates + 1
+    try:
+        ledger.validate(loss_value=loss_value, scored=scored,
+                        requires_grad=True, gradient_state=gradient_state)
+    except Exception as exc:  # noqa: BLE001 - re-raised with diagnostics
+        raise _numerical_error(
+            phase="post_backward", gradient_state=gradient_state,
+            finiteness=_finiteness_report(torch, model),
+            loss=loss_value, loss_components=components, attempted_update=attempted_update,
+            message=str(exc), exc=exc,
+        ) from exc
+    _assert_pre_step_finite(torch, model, gradient_state=gradient_state,
+                            loss=loss_value, loss_components=components,
+                            attempted_update=attempted_update)
+    norm, max_abs, clip = _prepare_step_gradients(
+        torch, model, grad_clip_norm=grad_clip_norm,
+        gradient_state=gradient_state, loss=loss_value,
+        loss_components=components, attempted_update=attempted_update,
+    )
+    if not step_grad_norm and grad_clip_norm is None:
+        norm = norm
     optimizer.step()
+    weights_finite, weights_nonfinite_count = _parameter_finiteness(torch, model)
+    if not weights_finite:
+        raise _numerical_error(
+            phase="post_step", gradient_state=gradient_state,
+            finiteness=_finiteness_report(torch, model),
+            loss=loss_value, loss_components=components, attempted_update=attempted_update,
+            message="optimizer.step produced a nonfinite parameter",
+        )
     ledger.commit()
     metrics = {
-        "loss": float(total.detach()),
+        "loss": loss_value,
         "scored_predictions": scored,
         "history_steps": batch.history_steps,
         "grad_norm": norm,
+        "max_abs_grad": max_abs,
         "seconds": time.perf_counter() - started,
         "max_hebb": float(previous[0].M[0].detach().abs().max()),
+        "weights_finite": weights_finite,
+        "weights_nonfinite_count": weights_nonfinite_count,
+        **_grad_clip_metric(grad_clip_norm is not None, grad_clip_norm, clip),
         **batch.diversity(),
     }
     del previous
@@ -1607,7 +1894,8 @@ def _episode_update(torch, model, optimizer, plan, *, batch_size: int,
 
 def _rollout_update(torch, model, optimizer, plan, *, chunk_index: int,
                     batch_size: int, rollout: int, weights, device: str,
-                    ledger: UpdateLedger, visited, previous, step_grad_norm: bool = True) -> dict:
+                    ledger: UpdateLedger, visited, previous,
+                    step_grad_norm: bool = True, grad_clip_norm=None) -> dict:
     """One rollout chunk over independent lane episodes (truncated BPTT).
 
     This path exists for throughput/memory benchmarks and cannot be flagged as
@@ -1626,6 +1914,10 @@ def _rollout_update(torch, model, optimizer, plan, *, chunk_index: int,
     scored = loss["scored_predictions"]
     stepped = False
     norm = None
+    max_abs = None
+    clip = None
+    weights_finite = None
+    weights_nonfinite_count = 0
     if scored > 0:
         if not bool(torch.isfinite(loss["loss"])):
             raise ValueError("nonfinite rollout loss")
@@ -1633,15 +1925,42 @@ def _rollout_update(torch, model, optimizer, plan, *, chunk_index: int,
             raise ValueError("rollout loss does not require grad")
         optimizer.zero_grad(set_to_none=True)
         loss["loss"].backward()
-        finite = _gradients_finite(torch, model)
-        ledger.validate(loss_value=float(loss["loss"].detach()), scored=scored,
-                        requires_grad=True, gradients_finite=finite)
-        norm = _gradient_norm(model) if step_grad_norm else None
+        gradient_state = _gradient_state(torch, model)
+        loss_value = float(loss["loss"].detach())
+        components = loss.get("components")
+        attempted_update = ledger.updates + 1
+        try:
+            ledger.validate(loss_value=loss_value, scored=scored,
+                            requires_grad=True, gradient_state=gradient_state)
+        except Exception as exc:  # noqa: BLE001 - re-raised with diagnostics
+            raise _numerical_error(
+                phase="post_backward", gradient_state=gradient_state,
+                finiteness=_finiteness_report(torch, model),
+                loss=loss_value, loss_components=components, attempted_update=attempted_update,
+                message=str(exc), exc=exc,
+            ) from exc
+        _assert_pre_step_finite(torch, model, gradient_state=gradient_state,
+                                loss=loss_value, loss_components=components,
+                                attempted_update=attempted_update)
+        norm, max_abs, clip = _prepare_step_gradients(
+            torch, model, grad_clip_norm=grad_clip_norm,
+            gradient_state=gradient_state, loss=loss_value,
+            loss_components=components, attempted_update=attempted_update,
+        )
         optimizer.step()
+        weights_finite, weights_nonfinite_count = _parameter_finiteness(torch, model)
+        if not weights_finite:
+            raise _numerical_error(
+                phase="post_step", gradient_state=gradient_state,
+                finiteness=_finiteness_report(torch, model),
+                loss=loss_value, loss_components=components, attempted_update=attempted_update,
+                message="optimizer.step produced a nonfinite parameter",
+            )
         ledger.commit()
         stepped = True
     else:
         ledger.mark_skipped()
+        weights_finite, weights_nonfinite_count = _parameter_finiteness(torch, model)
     # Detach after the backward so the next chunk cannot backprop through it.
     carry = [forward[-1].detach()]
     return {
@@ -1649,12 +1968,16 @@ def _rollout_update(torch, model, optimizer, plan, *, chunk_index: int,
         "scored_predictions": scored,
         "history_steps": hi,
         "grad_norm": norm,
+        "max_abs_grad": max_abs,
         "seconds": time.perf_counter() - started,
         "stepped": stepped,
         "max_hebb": float(carry[0].M[0].detach().abs().max()),
+        "weights_finite": weights_finite,
+        "weights_nonfinite_count": weights_nonfinite_count,
         "visited": visited,
         "previous": carry,
         "next_chunk": chunk_index + 1,
+        **_grad_clip_metric(grad_clip_norm is not None, grad_clip_norm, clip),
         **batch.diversity(),
     }
 
@@ -2476,7 +2799,8 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
     updates_per_episode = settings["episode_length"] // settings["rollout"]
     last_metrics: dict | None = None
 
-    def _snapshot(update: int, *, stopping: bool = False, committed: bool = True) -> None:
+    def _snapshot(update: int, *, stopping: bool = False, committed: bool = True,
+                  diagnostic: dict | None = None) -> None:
         nonlocal stream, previous, visited
         state = {
             "updates": ledger.updates,
@@ -2502,7 +2826,8 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
             # A failed optimizer step is diagnostic only. It never becomes a
             # numbered checkpoint, never aliases training-state.pt and never
             # enters checkpoints.json.
-            save_failure_snapshot(model, optimizer, out, update, record=record, state=state)
+            save_failure_snapshot(model, optimizer, out, update, record=record, state=state,
+                                  diagnostic=diagnostic)
             return
         save_artifacts(
             model, optimizer, out, update, record=record, state=state,
@@ -2535,7 +2860,7 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                         torch, model, optimizer, batch,
                         batch_size=settings["batch_size"], rollout=settings["rollout"],
                         weights=weights, device=device, ledger=ledger,
-                        step_grad_norm=(ledger.updates % settings["log_every"] == 0),
+                        grad_clip_norm=settings.get("grad_clip_norm"),
                     )
                     # Commit only after a real scored optimizer step, so a
                     # failed batch is retried with the same assignments.
@@ -2564,6 +2889,9 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                         "scored_predictions": result["scored_predictions"],
                         "history_steps": result["history_steps"],
                         "grad_norm": result["grad_norm"],
+                        "max_abs_grad": result["max_abs_grad"],
+                        "weights_finite": result["weights_finite"],
+                        "weights_nonfinite_count": result["weights_nonfinite_count"],
                         "seconds": result["seconds"],
                         "lr": float(lr),
                         "eta": float(model.hyper["eta"]),
@@ -2575,6 +2903,7 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                         ),
                         "credit_assignment": "full_episode_bptt",
                     }
+                    metric.update({key: result[key] for key in GRAD_CLIP_METRIC_FIELDS})
                 else:
                     if previous is None or stream["chunk"] == 0:
                         batch = batches.batch(
@@ -2592,7 +2921,7 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                         chunk_index=stream["chunk"], batch_size=settings["batch_size"],
                         rollout=settings["rollout"], weights=weights, device=device,
                         ledger=ledger, visited=visited, previous=previous,
-                        step_grad_norm=(ledger.updates % settings["log_every"] == 0),
+                        grad_clip_norm=settings.get("grad_clip_norm"),
                     )
                     chunks_consumed += 1
                     visited, previous = result["visited"], result["previous"]
@@ -2626,13 +2955,17 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                         "scored_predictions": result["scored_predictions"],
                         "history_steps": result["history_steps"],
                         "grad_norm": result["grad_norm"],
+                        "max_abs_grad": result["max_abs_grad"],
+                        "weights_finite": result["weights_finite"],
+                        "weights_nonfinite_count": result["weights_nonfinite_count"],
                         "stepped": bool(result["stepped"]),
                         "seconds": result["seconds"],
                         "lr": float(lr),
                         "credit_assignment": "truncated_bptt_rollout",
                     }
+                    metric.update({key: result[key] for key in GRAD_CLIP_METRIC_FIELDS})
                 _vram_guard(torch, settings)
-                metrics.write(json.dumps(metric) + "\n")
+                metrics.write(json.dumps(metric, allow_nan=False) + "\n")
                 metrics.flush()
                 if ledger.updates % settings["log_every"] == 0 or ledger.updates == settings["iterations"]:
                     print(json.dumps({"update": ledger.updates, "loss": metric["loss"],
@@ -2655,8 +2988,9 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
         failure = {"type": type(exc).__name__, "message": str(exc),
                    "traceback": traceback.format_exc()}
         status = "failed"
+        diagnostic = getattr(exc, "diagnostic", None)
         try:
-            _snapshot(ledger.updates, stopping=True, committed=False)
+            _snapshot(ledger.updates, stopping=True, committed=False, diagnostic=diagnostic)
             failure_snapshot_taken = True
         except Exception:  # pragma: no cover - best effort on a failing run
             pass
@@ -2713,6 +3047,7 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
         "credit_assignment": ("full_episode_bptt" if settings["bptt"] == "episode"
                               else "truncated_bptt_rollout"),
         "route_policy": settings.get("route_policy", DEFAULT_ROUTE_POLICY),
+        "grad_clip_norm": settings.get("grad_clip_norm"),
         "independent_lane_batches": (
             ledger.updates if settings["bptt"] == "episode" else None
         ),
@@ -2821,7 +3156,7 @@ def load_fitted(prepared: Path, repo: Path = adapter.DEFAULT_REPO, *, update: in
 PAIR_FIELDS = (
     "iterations", "batch_size", "episode_length", "rollout", "bptt",
     "schedule", "seed", "cue_seed", "route_seed", "family_seed",
-    "route_policy",
+    "route_policy", "grad_clip_norm",
 )
 
 
@@ -2893,6 +3228,8 @@ def lane_parity_audit(single_config: dict, single_manifest: dict,
 def pair_value(config, field):
     if field == "route_policy":
         return config["training"].get(field, DEFAULT_ROUTE_POLICY)
+    if field == "grad_clip_norm":
+        return config["training"].get(field)
     return config["training"][field]
 
 
