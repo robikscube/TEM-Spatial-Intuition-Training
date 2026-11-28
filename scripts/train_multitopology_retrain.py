@@ -783,7 +783,7 @@ def action4_crossings(graph: dict) -> list[tuple[int, int]]:
     return sorted(crossings)
 
 
-def _shortest_path(transitions, start: int, goal: int, *, forbidden=None):
+def _shortest_path(transitions, start: int, goal: int, *, forbidden=None, forbid_nodes=()):
     """BFS over public transitions; ``forbidden`` is one directed edge."""
     queue = deque([start])
     previous: dict[int, int | None] = {start: None}
@@ -793,6 +793,8 @@ def _shortest_path(transitions, start: int, goal: int, *, forbidden=None):
         if node == goal:
             break
         for action, target in sorted(transitions[node].items()):
+            if target in forbid_nodes and target != goal:
+                continue
             if forbidden is not None and (node, target) == forbidden:
                 continue
             if target in previous:
@@ -841,10 +843,11 @@ def legal_walk(graph: dict, rng: random.Random, length: int) -> tuple[list[int],
     return worlds.walk(graph, rng, length)
 
 
-def _reciprocal_attempt(graph, seed, length, *, leading, delay):
+def _reciprocal_attempt(graph, seed, length, *, leading, delay, retry: int = 0):
     """One deterministic attempt; returns ``(nodes, actions, lag)`` or ``None``."""
     transitions = graph["transitions"]
-    rng = random.Random(f"p1:{seed}:{leading}:{delay}")
+    key = f"p1:{seed}:{leading}:{delay}" if retry == 0 else f"p1:{seed}:r{retry}:{leading}:{delay}"
+    rng = random.Random(key)
     crossings = action4_crossings(graph)
     target, source = crossings[rng.randrange(len(crossings))]
     focal = (source, target)
@@ -856,11 +859,12 @@ def _reciprocal_attempt(graph, seed, length, *, leading, delay):
     ):
         return None
     # Shortest path to T, also avoiding an early S -> T crossing.
-    path_nodes, path_actions = _shortest_path(
+    to_target = _shortest_path(
         transitions, nodes[-1], target, forbidden=focal,
     )
-    if path_nodes is None:
+    if to_target is None:
         return None
+    path_nodes, path_actions = to_target
     actions.extend(path_actions)
     nodes.extend(path_nodes[1:])
     cross_index = len(nodes) - 1  # T observed here
@@ -872,7 +876,9 @@ def _reciprocal_attempt(graph, seed, length, *, leading, delay):
         forbid_nodes={target}, forbidden=focal,
     ):
         return None
-    back = _shortest_path(transitions, nodes[-1], source, forbidden=focal)
+    back = _shortest_path(
+        transitions, nodes[-1], source, forbidden=focal, forbid_nodes={target},
+    )
     if back is None or target in back[0]:
         return None
     back_nodes, back_actions = back
@@ -894,16 +900,16 @@ def reciprocal_return_walk(graph: dict, rng: random.Random, length: int) -> tupl
     """P1-compatible route: observe T -> S, distract, return, cross S -> T.
 
     The final transition is the reciprocal return S -> T (action 4) whose target
-    cue was last observed 12-23 observations earlier at T. From start to finish
-    the route is: an optional leading legal walk, a shortest path to T, the
-    observed crossing T -> S, a distractor that never re-enters T or reuses the
-    focal passage in either direction, a shortest path back to S, and the
-    queried crossing S -> T.
+    cue was last observed at least ``P1_MIN_RETURN_DELAY`` observations earlier
+    at T. From start to finish the route is: an optional leading legal walk, a
+    shortest path to T, the observed crossing T -> S, a distractor that never
+    re-enters T or reuses the focal passage in either direction, a shortest path
+    back to S avoiding T, and the queried crossing S -> T.
 
-    Exact length is resolved by a deterministic two-parameter search: the search
-    only uses the public transition table, and the first feasible attempt in the
-    declared order is frozen. No cue, label, score, final payload or evaluator
-    state enters the choice.
+    Exact length is resolved by a deterministic search: the search only uses the
+    public transition table, and the first feasible attempt in the declared
+    order is frozen. No cue, label, score, final payload or evaluator state
+    enters the choice.
     """
     if length < P1_MIN_RETURN_DELAY + 8:
         raise ValueError(
@@ -914,15 +920,18 @@ def reciprocal_return_walk(graph: dict, rng: random.Random, length: int) -> tupl
     seed = rng.random()
     # Search the primary >=24 stratum first; the 12-23 stratum is not claimed.
     delays = list(range(P1_MIN_RETURN_DELAY, max(P1_MIN_RETURN_DELAY, length)))
-    for leading in range(0, 9):
-        for delay in delays:
-            attempt = _reciprocal_attempt(graph, seed, length, leading=leading, delay=delay)
-            if attempt is None:
-                continue
-            nodes, actions, lag = attempt
-            if lag < P1_MIN_RETURN_DELAY:
-                continue
-            return nodes, actions
+    for retry in range(16):
+        for leading in range(0, 9):
+            for delay in delays:
+                attempt = _reciprocal_attempt(
+                    graph, seed, length, leading=leading, delay=delay, retry=retry,
+                )
+                if attempt is None:
+                    continue
+                nodes, actions, lag = attempt
+                if lag < P1_MIN_RETURN_DELAY:
+                    continue
+                return nodes, actions
     raise ValueError(
         f"{graph.get('id')}: no exact-length P1 reciprocal return fits {length} observations"
     )
