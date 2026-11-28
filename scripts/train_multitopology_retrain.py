@@ -156,8 +156,14 @@ TRAINING_KEYS = {
     # absent (the exact historical numerical path). A finite positive int/float
     # enables the prospective bound; there is no silent default threshold.
     "grad_clip_norm",
+    # Optional adapter-level inverse-variance numerical guard ("log_precision").
+    # Absent means the exact historical upstream utils.inv_var_weight path.
+    "inv_var_guard",
 }
-REQUIRED_TRAINING_KEYS = TRAINING_KEYS - {"scientific_stage", "route_policy", "grad_clip_norm"}
+INV_VAR_GUARDS = ("log_precision",)
+REQUIRED_TRAINING_KEYS = TRAINING_KEYS - {
+    "scientific_stage", "route_policy", "grad_clip_norm", "inv_var_guard",
+}
 GRAD_CLIP_METRIC_FIELDS = (
     "grad_clip_enabled", "grad_clip_threshold",
     "grad_clip_raw_global_norm", "grad_clip_post_global_norm", "grad_clip_applied",
@@ -509,6 +515,13 @@ def validate_config(config: dict, *, resolved: bool = False) -> None:
             raise ValueError(
                 "training.grad_clip_norm must be a finite positive number; "
                 "omit the key to disable gradient clipping"
+            )
+    if "inv_var_guard" in settings:
+        guard = settings["inv_var_guard"]
+        if not isinstance(guard, str) or guard not in INV_VAR_GUARDS:
+            raise ValueError(
+                f"training.inv_var_guard must be one of {list(INV_VAR_GUARDS)}; "
+                "omit the key to use stock upstream inv_var_weight"
             )
     if type(settings["scientific_mode"]) is not bool:
         raise ValueError("training.scientific_mode must be a boolean")
@@ -1258,6 +1271,44 @@ class EpisodeBatches:
 # ------------------------------------------------------------------- model IO
 
 
+def _inv_var_weight_log_precision(torch, mus, sigmas, *,
+                                  min_sigma: float = 1e-6,
+                                  max_sigma: float = 1e6):
+    """Log-precision inverse-variance fusion preventing FP32 sigma^2 underflow/overflow.
+
+    Mathematically equivalent to upstream ``utils.inv_var_weight`` in exact real
+    arithmetic on positive sigmas, while avoiding ``1 / sigma**2`` overflow,
+    ``0 * inf = NaN`` backward products, and ``sqrt(0)`` infinite derivatives.
+    """
+    mus_t = torch.stack(mus, dim=0)
+    sigmas_t = torch.stack(sigmas, dim=0).clamp(min=min_sigma, max=max_sigma)
+    log_prec = -2.0 * torch.log(sigmas_t)
+    weights = torch.softmax(log_prec, dim=0)
+    inv_var_avg = torch.sum(weights * mus_t, dim=0)
+    log_sum_prec = torch.logsumexp(log_prec, dim=0)
+    inv_var_sigma = torch.exp(-0.5 * log_sum_prec)
+    return inv_var_avg, inv_var_sigma
+
+
+def _install_inv_var_guard(torch, upstream, guard: str | None) -> None:
+    """Install or cleanly restore the adapter-level inverse-variance guard."""
+    utils_mod = getattr(upstream, "utils", None)
+    if utils_mod is None:
+        return
+    if not hasattr(utils_mod, "_orig_inv_var_weight"):
+        utils_mod._orig_inv_var_weight = utils_mod.inv_var_weight
+    if guard is None:
+        utils_mod.inv_var_weight = utils_mod._orig_inv_var_weight
+        return
+    if guard != "log_precision":
+        raise ValueError(f"unsupported inv_var_guard: {guard!r}")
+
+    def _guarded_inv_var_weight(mus, sigmas):
+        return _inv_var_weight_log_precision(torch, mus, sigmas)
+
+    utils_mod.inv_var_weight = _guarded_inv_var_weight
+
+
 def initialize(config: dict, repo: str | Path = adapter.DEFAULT_REPO):
     """Construct a TEM model exactly as the native access adapter does."""
     torch = adapter.require_torch()
@@ -1269,6 +1320,7 @@ def initialize(config: dict, repo: str | Path = adapter.DEFAULT_REPO):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(settings["seed"])
     upstream = adapter.load_upstream(Path(repo))
+    _install_inv_var_guard(torch, upstream, settings.get("inv_var_guard"))
     params = adapter.default_params(upstream, iterations=settings["iterations"])
     params["n_actions"] = len(worlds.ACTION_LABELS) - 1
     if settings["schedule"] == "pilot":
@@ -3048,6 +3100,7 @@ def train(prepared: Path, repo: Path = adapter.DEFAULT_REPO, approved_config_sha
                               else "truncated_bptt_rollout"),
         "route_policy": settings.get("route_policy", DEFAULT_ROUTE_POLICY),
         "grad_clip_norm": settings.get("grad_clip_norm"),
+        "inv_var_guard": settings.get("inv_var_guard"),
         "independent_lane_batches": (
             ledger.updates if settings["bptt"] == "episode" else None
         ),
@@ -3156,7 +3209,7 @@ def load_fitted(prepared: Path, repo: Path = adapter.DEFAULT_REPO, *, update: in
 PAIR_FIELDS = (
     "iterations", "batch_size", "episode_length", "rollout", "bptt",
     "schedule", "seed", "cue_seed", "route_seed", "family_seed",
-    "route_policy", "grad_clip_norm",
+    "route_policy", "grad_clip_norm", "inv_var_guard",
 )
 
 
@@ -3228,7 +3281,7 @@ def lane_parity_audit(single_config: dict, single_manifest: dict,
 def pair_value(config, field):
     if field == "route_policy":
         return config["training"].get(field, DEFAULT_ROUTE_POLICY)
-    if field == "grad_clip_norm":
+    if field in ("grad_clip_norm", "inv_var_guard"):
         return config["training"].get(field)
     return config["training"][field]
 

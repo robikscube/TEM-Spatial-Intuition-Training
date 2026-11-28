@@ -969,6 +969,68 @@ class GradClipAndNumericalDiagnosticsTest(unittest.TestCase):
         self.assertEqual(ctx.exception.phase, "post_clip")
         json.dumps(ctx.exception.diagnostic, allow_nan=False)
 
+    def test_inv_var_guard_config_pairing_and_continuation(self):
+        cfg = config_dict(training_settings())
+        tem.validate_config(cfg)
+        ok = config_dict(training_settings(inv_var_guard="log_precision"))
+        tem.validate_config(ok)
+        for bad in (None, True, False, 1, "", "clamp", "invalid"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    tem.validate_config(config_dict(training_settings(inv_var_guard=bad)))
+
+        single = {**cfg, "arm": "single", "training_graph_ids": ["g0"]}
+        diverse_same = {**cfg, "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        diverse_diff = {**ok, "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        rec = {"manifest_sha256": "a" * 64}
+        self.assertTrue(tem.pairing_checks(single, diverse_same, rec, rec)["checks"]["inv_var_guard"])
+        self.assertFalse(tem.pairing_checks(single, diverse_diff, rec, rec)["checks"]["inv_var_guard"])
+
+        prior_cfg = {**config_dict(interim_settings()), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        next_cfg = {**config_dict(standard_settings(inv_var_guard="log_precision")), "arm": "diverse", "training_graph_ids": ["g0", "g1"]}
+        prior_rec = {"config_sha256": "1" * 64, "manifest_sha256": "a" * 64, "code_sha256": {"k": "v"}, "arm": "diverse", "training_seed": 3}
+        next_rec = {"config_sha256": "2" * 64, "manifest_sha256": "a" * 64, "code_sha256": {"k": "v"}, "arm": "diverse", "training_seed": 3}
+        with self.assertRaisesRegex(ValueError, "inv_var_guard"):
+            tem.continuation_checks(prior_cfg, prior_rec, tem.INTERIM_UPDATES, next_cfg, next_rec)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for inv_var_guard math tests")
+    def test_inv_var_guard_log_precision_equivalence_and_extreme_sigma(self):
+        import types
+        torch = adapter.require_torch()
+
+        def stock_inv_var_weight(mus, sigmas):
+            sum_var = sum(1.0 / (s ** 2) for s in sigmas)
+            inv_var_var = 1.0 / sum_var
+            inv_var_avg = sum(m / (s ** 2) for m, s in zip(mus, sigmas)) * inv_var_var
+            return inv_var_avg, torch.sqrt(inv_var_var)
+
+        fake_utils = types.SimpleNamespace(inv_var_weight=stock_inv_var_weight)
+        fake_upstream = types.SimpleNamespace(utils=fake_utils)
+
+        m1, m2 = torch.randn(4, 30), torch.randn(4, 30)
+        s1, s2 = torch.rand(4, 30).add(0.1), torch.rand(4, 30).add(0.1)
+        a_ref, sg_ref = stock_inv_var_weight([m1, m2], [s1, s2])
+        a_new, sg_new = tem._inv_var_weight_log_precision(torch, [m1, m2], [s1, s2])
+        self.assertLess(float((a_ref - a_new).abs().max()), 1e-5)
+        self.assertLess(float((sg_ref - sg_new).abs().max()), 1e-5)
+
+        tem._install_inv_var_guard(torch, fake_upstream, "log_precision")
+        try:
+            x1 = torch.tensor([[1.0, -0.5]], requires_grad=True)
+            x2 = torch.tensor([[0.2, 0.8]], requires_grad=True)
+            z1 = torch.tensor([[-50.0, 0.0]], requires_grad=True)
+            z2 = torch.tensor([[0.0, -50.0]], requires_grad=True)
+            avg, sg = fake_utils.inv_var_weight([x1, x2], [torch.exp(z1), torch.exp(z2)])
+            loss = (avg ** 2).sum() + (sg ** 2).sum()
+            loss.backward()
+            self.assertTrue(bool(torch.isfinite(loss)))
+            self.assertTrue(bool(torch.isfinite(z1.grad).all()))
+            self.assertTrue(bool(torch.isfinite(z2.grad).all()))
+            self.assertTrue(bool(torch.isfinite(x1.grad).all()))
+        finally:
+            tem._install_inv_var_guard(torch, fake_upstream, None)
+        self.assertIs(fake_utils.inv_var_weight, stock_inv_var_weight)
+
 
 if __name__ == "__main__":
     unittest.main()
